@@ -47,7 +47,7 @@ object AudioServerBehavior {
 
       case HttpRequestMessage(HttpRequest(HttpMethods.GET, AudioPath(siteId, requestId), _, entity, _), replyTo) if audioMap.contains((siteId, requestId)) =>
         entity.discardBytes()
-        context.log.info(s"audio request received: ($siteId, $requestId)")
+        context.log.debug(s"audio request received: ($siteId, $requestId)")
         val (audio, _) = audioMap((siteId, requestId))
         replyTo ! HttpResponse(entity = HttpEntity(MediaTypes.`audio/wav`, audio))
         Behaviors.same

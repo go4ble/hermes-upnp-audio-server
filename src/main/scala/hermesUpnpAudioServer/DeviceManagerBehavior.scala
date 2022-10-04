@@ -10,7 +10,7 @@ import scala.util.{Failure, Success, Try}
 object DeviceManagerBehavior {
   sealed trait DeviceManagerMessage
 
-  final case class AddDeviceMessage(siteId: String, deviceLocation: URL, deviceType: String, eventSubscriber: Option[ActorRef[DeviceBehavior.Event]])
+  final case class AddDeviceMessage(siteId: String, deviceLocation: URL, deviceType: String, eventSubscriber: Map[String, ActorRef[DeviceBehavior.Event]])
       extends DeviceManagerMessage
   private final case class DeviceAddedMessage(siteId: String, device: Try[(Device, Behavior[DeviceBehavior.DeviceMessage])]) extends DeviceManagerMessage
 

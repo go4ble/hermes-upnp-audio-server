@@ -51,7 +51,7 @@ object DeviceBehavior {
   private final case class EventReceivedMessage(serviceType: ServiceType, seq: Long, propertySetXml: Try[NodeSeq]) extends DeviceMessage
   private final case class ServerCeasedMessage(result: Try[Done]) extends DeviceMessage
 
-  def apply(deviceLocation: URL, deviceType: String, eventSubscriber: Option[ActorRef[Event]])(implicit
+  def apply(deviceLocation: URL, deviceType: String, eventSubscriber: Map[String, ActorRef[Event]])(implicit
       system: ActorSystem[_]
   ): Future[(Device, Behavior[DeviceMessage])] = {
     implicit val ec: ExecutionContext = system.executionContext
@@ -65,12 +65,13 @@ object DeviceBehavior {
     } yield (device, DeviceBehavior(deviceLocation, device, eventSubscriber))
   }
 
-  def apply(deviceLocation: URL, device: Device, eventSubscriber: Option[ActorRef[Event]]): Behavior[DeviceMessage] = Behaviors.setup { context =>
+  def apply(deviceLocation: URL, device: Device, eventSubscriber: Map[String, ActorRef[Event]]): Behavior[DeviceMessage] = Behaviors.setup { context =>
     implicit val system: ActorSystem[_] = context.system
     implicit val ec: ExecutionContext = context.executionContext
 
-    eventSubscriber.foreach { _ =>
-      context.log.info(s"subscribing to ${device.serviceList.length} events")
+    if (eventSubscriber.nonEmpty) {
+      val unknownServiceTypes = eventSubscriber.keys.toSet -- device.serviceList.map(_.serviceType)
+      require(unknownServiceTypes.isEmpty, s"unsupported service types for ${device.friendlyName}: $unknownServiceTypes")
       val serverPort = getAvailablePort
       context.log.info(s"starting device server at http://$defaultInterface:$serverPort")
       val parserSettings = ParserSettings.forServer.withCustomMethods(upnp.Methods.NOTIFY)
@@ -79,7 +80,7 @@ object DeviceBehavior {
         connection.handleWithAsyncHandler(request => context.self.ask(HttpRequestMessage(request, _))(5.seconds, system.scheduler))
       }
       context.pipeToSelf(server)(ServerCeasedMessage)
-      device.serviceList.foreach { service =>
+      device.serviceList.filter(eventSubscriber.keySet contains _.serviceType).foreach { service =>
         val subscribeRequest = HttpRequest(
           method = upnp.Methods.SUBSCRIBE,
           uri = new URL(deviceLocation.getProtocol, deviceLocation.getHost, deviceLocation.getPort, service.eventSubURL).toString,
@@ -98,7 +99,7 @@ object DeviceBehavior {
   private def apply(
       deviceLocation: URL,
       device: Device,
-      eventSubscriber: Option[ActorRef[Event]],
+      eventSubscriber: Map[String, ActorRef[Event]],
       serviceSubscriptions: Map[SubscriptionId, ServiceType]
   ): Behavior[DeviceMessage] = Behaviors.setup { context =>
     implicit val system: ActorSystem[_] = context.system
@@ -126,18 +127,20 @@ object DeviceBehavior {
         val subscriptionId = headers.find(_ is "sid").map(_.value()).getOrElseError("unable to find SID in notify request")
         val serviceType = serviceSubscriptions.get(subscriptionId).getOrElseError(s"unable to find subscription for $subscriptionId")
         context.pipeToSelf(Unmarshal(entity).to[NodeSeq])(EventReceivedMessage(serviceType, seq, _))
-        replyTo ! HttpResponse(status = StatusCodes.NoContent)
+        replyTo ! HttpResponse(status = StatusCodes.OK)
         Behaviors.same
 
       case HttpRequestMessage(unexpectedRequest, replyTo) =>
         context.log.error(s"unexpected request: $unexpectedRequest")
         unexpectedRequest.discardEntityBytes()
-        replyTo ! HttpResponse(status = StatusCodes.NoContent)
+        replyTo ! HttpResponse(status = StatusCodes.OK)
         Behaviors.same
 
       case EventReceivedMessage(serviceType, _, Success(propertySetXml)) =>
-        val properties = (propertySetXml \ "property").headOption.fold[Seq[Node]](Nil)(_.child).map(n => (n.label, n.text)).toMap
-        eventSubscriber.get ! Event(serviceType, properties)
+        val eventXml = XML.loadString((propertySetXml \\ "LastChange").text)
+        val eventProperties = getEventProperties(eventXml)
+        context.log.debug(s"$serviceType event: $eventProperties")
+        eventSubscriber(serviceType) ! Event(serviceType, eventProperties)
         Behaviors.same
 
       case EventReceivedMessage(serviceType, seq, Failure(exception)) =>
@@ -150,6 +153,7 @@ object DeviceBehavior {
         // TODO renew subscriptions with timer
         // TODO unsubscribe in coordinated shutdown
         context.log.info(s"successfully subscribed to $serviceType with id $subscriptionId")
+        response.discardEntityBytes()
         DeviceBehavior(deviceLocation, device, eventSubscriber, serviceSubscriptions.updated(subscriptionId, serviceType))
 
       case ServiceSubscriptionMessage(serviceType, Failure(exception)) =>
@@ -169,4 +173,10 @@ object DeviceBehavior {
     case HttpHeader.ParsingResult.Ok(header, _) => header
     case HttpHeader.ParsingResult.Error(error)  => throw new Exception(s"failed to parse header ($name, $value): $error")
   }
+
+  def getEventProperties(xml: Elem): Properties =
+    xml.child
+      .collect { case elem: Elem => getEventProperties(elem) }
+      .foldLeft(Map.empty: Properties)(_ ++ _)
+      .concat(xml.attribute("val").map(xml.label -> _.text))
 }

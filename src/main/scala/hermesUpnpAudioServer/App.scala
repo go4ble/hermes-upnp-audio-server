@@ -30,6 +30,7 @@ object App extends scala.App {
       implicit val system: ActorSystem[_] = context.system
       implicit val scheduler: Scheduler = system.scheduler
       implicit val timeout: Timeout = 5.seconds
+      val logger = context.log
 
       // TODO children monitoring
       val audioServer = context.spawn(AudioServerBehavior(), "AudioServer")
@@ -46,34 +47,33 @@ object App extends scala.App {
         "raspi02" -> new URL("http://10.0.0.31:1400/xml/device_description.xml")
       )
       sites.foreach { case (siteId, deviceLocation) =>
-        deviceManager ! DeviceManagerBehavior.AddDeviceMessage(siteId, deviceLocation, MediaRendererDeviceType, None) // TODO events
+        deviceManager ! DeviceManagerBehavior.AddDeviceMessage(
+          siteId,
+          deviceLocation,
+          MediaRendererDeviceType,
+          Map(AVTransportServiceType -> context.system.ignoreRef) // TODO leverage events to reply when done
+        )
       }
 
-      type Ctx = (String, String)
       val mqttSource = MqttSource.atMostOnce(
         settings = mqttSettings.withClientId(mqttBaseClientId + "_source"),
         subscriptions = MqttSubscriptions(PlayBytesTopic.topic, MqttQoS.atLeastOnce),
         bufferSize = 1
-      ) // .asSourceWithContext[Ctx](mqttMessage => PlayBytesTopic.unapply(mqttMessage.topic))
+      )
 
       val mqttSink = MqttSink(
         connectionSettings = mqttSettings.withClientId(mqttBaseClientId + "_sink"),
         defaultQos = MqttQoS.atLeastOnce
       )
 
-//      val publishAudioFlow = ActorFlow.askWithContext[MqttMessage, AudioServerBehavior.AudioServerMessage, URL, Ctx](audioServer) { (mqttMessage, replyTo) =>
-//        val PlayBytesTopic(siteId, requestId) = mqttMessage.topic
-//        AudioServerBehavior.PublishAudioMessage(siteId, requestId, mqttMessage.payload.toArray, replyTo)
-//      }
-
       val streamStatus = mqttSource
         .filter(_.topic match {
           case PlayBytesTopic(siteId, _) => sites contains siteId
           case _                         => false
         })
-//        .asSourceWithContext[Ctx](mqttMessage => PlayBytesTopic.unapply(mqttMessage.topic).get)
         .mapAsync(1) { mqttMessage =>
           val PlayBytesTopic(siteId, requestId) = mqttMessage.topic
+          logger.debug(s"play bytes (${mqttMessage.payload.length}): " + mqttMessage.topic)
           for {
             url <- audioServer.ask(AudioServerBehavior.PublishAudioMessage(siteId, requestId, mqttMessage.payload.toArray, _))
             setUriProperties = Map("InstanceID" -> Some("0"), "CurrentURI" -> Some(url.toString), "CurrentURIMetaData" -> None)
