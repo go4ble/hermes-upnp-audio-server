@@ -14,10 +14,13 @@ import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
 
 object AudioServerBehavior {
+  type SiteId = String
+  type RequestId = String
+
   sealed trait AudioServerMessage
 
-  final case class PublishAudioMessage(siteId: String, requestId: String, audio: Array[Byte], replyTo: ActorRef[URL]) extends AudioServerMessage
-  // TODO RemoveAudioMessage
+  final case class PublishAudioMessage(siteId: SiteId, requestId: RequestId, audio: Array[Byte], replyTo: ActorRef[URL]) extends AudioServerMessage
+  final case class RemoveAudioMessage(siteId: SiteId, requestId: RequestId) extends AudioServerMessage
 
   private final case class HttpRequestMessage(request: HttpRequest, replyTo: ActorRef[HttpResponse]) extends AudioServerMessage
   private final case class ServerCeasedMessage(result: Try[Done]) extends AudioServerMessage
@@ -36,44 +39,52 @@ object AudioServerBehavior {
     AudioServerBehavior(baseUrl)
   }
 
-  private def apply(baseUrl: URL, audioMap: Map[(String, String), (Array[Byte], Long)] = Map.empty): Behavior[AudioServerMessage] = Behaviors.setup { context =>
-    implicit val mat: Materializer = SystemMaterializer(context.system).materializer
+  private def apply(baseUrl: URL, audioMap: Map[(SiteId, RequestId), (Array[Byte], Long)] = Map.empty): Behavior[AudioServerMessage] =
+    Behaviors.setup { context =>
+      implicit val mat: Materializer = SystemMaterializer(context.system).materializer
+      val fullSites = audioMap.toSeq
+        .groupMap { case ((siteId, _), _) => siteId } { case ((_, requestId), (_, createdAt)) => (requestId, createdAt) }
+        .filter { case (_, requests) => requests.length >= 10 }
+      require(fullSites.isEmpty, s"some sites have collected too much audio: $fullSites")
 
-    Behaviors.receiveMessage {
-      case PublishAudioMessage(siteId, requestId, audio, replyTo) =>
-        val url = new URL(baseUrl.getProtocol, baseUrl.getHost, baseUrl.getPort, AudioPath(siteId, requestId))
-        replyTo ! url
-        AudioServerBehavior(baseUrl, audioMap.updated((siteId, requestId), (audio, System.currentTimeMillis())))
+      Behaviors.receiveMessage {
+        case PublishAudioMessage(siteId, requestId, audio, replyTo) =>
+          val url = new URL(baseUrl.getProtocol, baseUrl.getHost, baseUrl.getPort, AudioPath(siteId, requestId))
+          replyTo ! url
+          AudioServerBehavior(baseUrl, audioMap.updated((siteId, requestId), (audio, System.currentTimeMillis())))
 
-      case HttpRequestMessage(HttpRequest(HttpMethods.GET, AudioPath(siteId, requestId), _, entity, _), replyTo) if audioMap.contains((siteId, requestId)) =>
-        entity.discardBytes()
-        context.log.debug(s"audio request received: ($siteId, $requestId)")
-        val (audio, _) = audioMap((siteId, requestId))
-        replyTo ! HttpResponse(entity = HttpEntity(MediaTypes.`audio/wav`, audio))
-        Behaviors.same
+        case RemoveAudioMessage(siteId, requestId) =>
+          AudioServerBehavior(baseUrl, audioMap.removed((siteId, requestId)))
 
-      case HttpRequestMessage(unexpectedRequest, replyTo) =>
-        context.log.error(s"unexpected request: $unexpectedRequest")
-        unexpectedRequest.discardEntityBytes()
-        replyTo ! HttpResponse(status = StatusCodes.NotFound)
-        Behaviors.same
+        case HttpRequestMessage(HttpRequest(HttpMethods.GET, AudioPath(siteId, requestId), _, entity, _), replyTo) if audioMap.contains((siteId, requestId)) =>
+          entity.discardBytes()
+          context.log.debug(s"audio request received: ($siteId, $requestId)")
+          val (audio, _) = audioMap((siteId, requestId))
+          replyTo ! HttpResponse(entity = HttpEntity(MediaTypes.`audio/wav`, audio))
+          Behaviors.same
 
-      case ServerCeasedMessage(Success(_)) =>
-        context.log.info("audio server ceased OK")
-        Behaviors.stopped
+        case HttpRequestMessage(unexpectedRequest, replyTo) =>
+          context.log.error(s"unexpected request: $unexpectedRequest")
+          unexpectedRequest.discardEntityBytes()
+          replyTo ! HttpResponse(status = StatusCodes.NotFound)
+          Behaviors.same
 
-      case ServerCeasedMessage(Failure(exception)) =>
-        context.log.error("audio server ceased unexpectedly", exception)
-        Behaviors.stopped
+        case ServerCeasedMessage(Success(_)) =>
+          context.log.info("audio server ceased OK")
+          Behaviors.stopped
+
+        case ServerCeasedMessage(Failure(exception)) =>
+          context.log.error("audio server ceased unexpectedly", exception)
+          Behaviors.stopped
+      }
     }
-  }
 
   private object AudioPath {
     private val AudioPathRegex = "/audio/(.+)/(.+).wav".r
 
-    def apply(siteId: String, requestId: String): String = s"/audio/$siteId/$requestId.wav"
+    def apply(siteId: SiteId, requestId: RequestId): String = s"/audio/$siteId/$requestId.wav"
 
-    def unapply(uri: Uri): Option[(String, String)] = uri.path.toString() match {
+    def unapply(uri: Uri): Option[(SiteId, RequestId)] = uri.path.toString() match {
       case AudioPathRegex(siteId, requestId) => Some((siteId, requestId))
       case _                                 => None
     }

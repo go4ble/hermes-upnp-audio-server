@@ -7,6 +7,7 @@ import akka.actor.typed.{ActorRef, ActorSystem, Scheduler}
 import akka.stream.alpakka.mqtt.scaladsl.{MqttSink, MqttSource}
 import akka.stream.alpakka.mqtt.{MqttConnectionSettings, MqttMessage, MqttQoS, MqttSubscriptions}
 import akka.util.{ByteString, Timeout}
+import hermesUpnpAudioServer.utils.audio
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 
@@ -51,7 +52,7 @@ object App extends scala.App {
           siteId,
           deviceLocation,
           MediaRendererDeviceType,
-          Map(AVTransportServiceType -> context.system.ignoreRef) // TODO leverage events to reply when done
+          Map.empty // no subscriptions
         )
       }
 
@@ -71,11 +72,12 @@ object App extends scala.App {
           case PlayBytesTopic(siteId, _) => sites contains siteId
           case _                         => false
         })
-        .mapAsync(1) { mqttMessage =>
+        .mapAsyncUnordered(sites.size) { mqttMessage =>
           val PlayBytesTopic(siteId, requestId) = mqttMessage.topic
-          logger.debug(s"play bytes (${mqttMessage.payload.length}): " + mqttMessage.topic)
+          val payload = mqttMessage.payload.toArray
+          logger.debug(s"play bytes (${payload.length}): " + mqttMessage.topic)
           for {
-            url <- audioServer.ask(AudioServerBehavior.PublishAudioMessage(siteId, requestId, mqttMessage.payload.toArray, _))
+            url <- audioServer.ask(AudioServerBehavior.PublishAudioMessage(siteId, requestId, payload, _))
             setUriProperties = Map("InstanceID" -> Some("0"), "CurrentURI" -> Some(url.toString), "CurrentURIMetaData" -> None)
             setUriMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceType, SetAVTransportURIAction, setUriProperties, _)
             setUriResponse <- deviceManager.ask((ref: ActorRef[DeviceBehavior.ActionResponse]) => DeviceManagerBehavior.SendMessage(siteId, setUriMessage(ref)))
@@ -84,7 +86,8 @@ object App extends scala.App {
             playMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceType, PlayAction, playProperties, _)
             playResponse <- deviceManager.ask((ref: ActorRef[DeviceBehavior.ActionResponse]) => DeviceManagerBehavior.SendMessage(siteId, playMessage(ref)))
             if playResponse.properties.isSuccess
-            _ <- Future { Thread.sleep(2500) } // TODO simulating play delay until events are implemented
+            _ <- Future(Thread.sleep(audio.estimatedDuration(payload).toMillis))
+            _ = audioServer ! AudioServerBehavior.RemoveAudioMessage(siteId, requestId)
           } yield (siteId, requestId)
         }
         .map { case (siteId, requestId) =>
