@@ -16,8 +16,12 @@ lazy val root = (project in file("."))
     libraryDependencies += "com.typesafe.akka" %% "akka-http" % AkkaHttpVersion,
     libraryDependencies += "com.typesafe.akka" %% "akka-http-xml" % AkkaHttpVersion,
     libraryDependencies += "com.lightbend.akka" %% "akka-stream-alpakka-mqtt" % "4.0.0",
-    libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.4.1"
+    libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.4.3"
   )
 
-// See https://www.scala-sbt.org/1.x/docs/Using-Sonatype.html for instructions on how to publish to Sonatype.
-// ef0aa3ce-8cbf-498f-a396-a4dcb3054b6b
+(Compile / compile) := ((Compile / compile) dependsOn scalafmtCheckAll).value
+
+enablePlugins(JavaAppPackaging)
+dockerBaseImage := "eclipse-temurin"
+dockerRepository := Some("ghcr.io/go4ble")
+dockerUpdateLatest := true

@@ -110,7 +110,9 @@ object DeviceBehavior {
 
     Behaviors.receiveMessage {
       case ActionRequestMessage(serviceTypePrefix, actionName, properties, replyTo) =>
-        val service = device.serviceList.find(_.serviceType startsWith serviceTypePrefix).getOrElseError(s"unable to find service $serviceTypePrefix for ${device.friendlyName}")
+        val service = device.serviceList
+          .find(_.serviceType startsWith serviceTypePrefix)
+          .getOrElseError(s"unable to find service $serviceTypePrefix for ${device.friendlyName}")
         val controlUrl = new URL(deviceLocation.getProtocol, deviceLocation.getHost, deviceLocation.getPort, service.controlURL)
         val propertiesXml = properties.map { case (k, v) => Elem(null, k, Null, TopScope, minimizeEmpty = true, v.map(Text(_)).toSeq: _*) }.toSeq
         val actionXml = Elem("u", actionName, Null, NamespaceBinding("u", service.serviceType, TopScope), minimizeEmpty = true, propertiesXml: _*)
