@@ -22,6 +22,8 @@ object App extends scala.App {
   val SetAVTransportURIAction = "SetAVTransportURI"
   val PlayAction = "Play"
 
+  val SiteConfigRegex = "^HERMES_UPNP_AUDIO_SERVER_SITE_(.+)$".r
+
   sealed trait AppMessage
   private final case class StreamCompleted(status: Try[Done]) extends AppMessage
 
@@ -44,10 +46,8 @@ object App extends scala.App {
         new MemoryPersistence
       )
 
-      val sites = Map(
-        "raspi02" -> new URL("http://10.0.0.31:1400/xml/device_description.xml")
-//        "raspi02" -> new URL("http://10.0.0.24:8888/upnp_descriptor_0")
-      )
+      val sites = sys.env.collect { case (SiteConfigRegex(siteId), UrlExtractor(deviceLocation)) => siteId -> deviceLocation }
+      require(sites.nonEmpty, "no site configurations were found")
       sites.foreach { case (siteId, deviceLocation) =>
         deviceManager ! DeviceManagerBehavior.AddDeviceMessage(
           siteId,
@@ -123,5 +123,9 @@ object App extends scala.App {
 
   private object PlayFinishedTopic {
     def apply(siteId: String): String = s"hermes/audioServer/$siteId/playFinished"
+  }
+
+  private object UrlExtractor {
+    def unapply(url: String): Option[URL] = Try(new URL(url)).toOption
   }
 }
