@@ -51,16 +51,18 @@ object DeviceBehavior {
   private final case class EventReceivedMessage(serviceType: ServiceType, seq: Long, propertySetXml: Try[NodeSeq]) extends DeviceMessage
   private final case class ServerCeasedMessage(result: Try[Done]) extends DeviceMessage
 
-  def apply(deviceLocation: URL, deviceType: String, eventSubscriber: Map[String, ActorRef[Event]])(implicit
+  def apply(deviceLocation: URL, deviceTypePrefix: String, eventSubscriber: Map[String, ActorRef[Event]])(implicit
       system: ActorSystem[_]
   ): Future[(Device, Behavior[DeviceMessage])] = {
     implicit val ec: ExecutionContext = system.executionContext
     for {
       response <- Http().singleRequest(HttpRequest(uri = deviceLocation.toString))
       _ = require(response.status.isSuccess())
-      responseXml <- Unmarshal(response).to[NodeSeq]
-      deviceXmlOpt = (responseXml \\ "device").find(node => (node \ "deviceType").headOption.map(_.text).contains(deviceType))
-      deviceXml = deviceXmlOpt.getOrElseError(s"could not locate device $deviceType at $deviceLocation")
+      contentType = response.entity.contentType
+      _ = if (!nodeSeqMediaTypes.contains(contentType)) system.log.warn(s"unexpected content type: $contentType")
+      responseXml <- Unmarshal(response.entity.withContentType(ContentTypes.`text/xml(UTF-8)`)).to[NodeSeq]
+      deviceXmlOpt = (responseXml \\ "device").find(node => (node \ "deviceType").headOption.map(_.text).exists(_ startsWith deviceTypePrefix))
+      deviceXml = deviceXmlOpt.getOrElseError(s"could not locate device $deviceTypePrefix at $deviceLocation")
       device = Device(deviceXml)
     } yield (device, DeviceBehavior(deviceLocation, device, eventSubscriber))
   }
@@ -107,14 +109,14 @@ object DeviceBehavior {
     implicit val mat: Materializer = SystemMaterializer(system).materializer
 
     Behaviors.receiveMessage {
-      case ActionRequestMessage(serviceType, actionName, properties, replyTo) =>
-        val service = device.serviceList.find(_.serviceType == serviceType).getOrElseError(s"unable to find service $serviceType for ${device.friendlyName}")
+      case ActionRequestMessage(serviceTypePrefix, actionName, properties, replyTo) =>
+        val service = device.serviceList.find(_.serviceType startsWith serviceTypePrefix).getOrElseError(s"unable to find service $serviceTypePrefix for ${device.friendlyName}")
         val controlUrl = new URL(deviceLocation.getProtocol, deviceLocation.getHost, deviceLocation.getPort, service.controlURL)
         val propertiesXml = properties.map { case (k, v) => Elem(null, k, Null, TopScope, minimizeEmpty = true, v.map(Text(_)).toSeq: _*) }.toSeq
-        val actionXml = Elem("u", actionName, Null, NamespaceBinding("u", serviceType, TopScope), minimizeEmpty = true, propertiesXml: _*)
-        val request = SoapActionRequest(controlUrl, serviceType, actionName, actionXml)
+        val actionXml = Elem("u", actionName, Null, NamespaceBinding("u", service.serviceType, TopScope), minimizeEmpty = true, propertiesXml: _*)
+        val request = SoapActionRequest(controlUrl, service.serviceType, actionName, actionXml)
         val responseF = Http().singleRequest(request).map(response => response.ensuring(_.status.isSuccess(), response)).flatMap(Unmarshal(_).to[NodeSeq])
-        context.pipeToSelf(responseF)(ActionResponseMessage(serviceType, actionName, _, replyTo))
+        context.pipeToSelf(responseF)(ActionResponseMessage(service.serviceType, actionName, _, replyTo))
         Behaviors.same
 
       case ActionResponseMessage(serviceType, actionName, xmlTry, replyTo) =>

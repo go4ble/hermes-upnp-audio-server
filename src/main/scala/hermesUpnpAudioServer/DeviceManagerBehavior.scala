@@ -10,35 +10,35 @@ import scala.util.{Failure, Success, Try}
 object DeviceManagerBehavior {
   sealed trait DeviceManagerMessage
 
-  final case class AddDeviceMessage(siteId: String, deviceLocation: URL, deviceType: String, eventSubscriber: Map[String, ActorRef[DeviceBehavior.Event]])
+  final case class AddDeviceMessage(siteId: String, deviceLocation: URL, deviceTypePrfix: String, eventSubscriber: Map[String, ActorRef[DeviceBehavior.Event]])
       extends DeviceManagerMessage
   private final case class DeviceAddedMessage(siteId: String, device: Try[(Device, Behavior[DeviceBehavior.DeviceMessage])]) extends DeviceManagerMessage
 
   final case class SendMessage(siteId: String, deviceMessage: DeviceBehavior.DeviceMessage) extends DeviceManagerMessage
 
-  def apply(): Behavior[DeviceManagerMessage] = DeviceManagerBehavior(Map[String, ActorRef[DeviceBehavior.DeviceMessage]]())
+  def apply(): Behavior[DeviceManagerMessage] = DeviceManagerBehavior(Map[String, (Device, ActorRef[DeviceBehavior.DeviceMessage])]())
 
   // TODO children monitoring
-  def apply(devices: Map[String, ActorRef[DeviceBehavior.DeviceMessage]]): Behavior[DeviceManagerMessage] = Behaviors.setup { context =>
+  def apply(devices: Map[String, (Device, ActorRef[DeviceBehavior.DeviceMessage])]): Behavior[DeviceManagerMessage] = Behaviors.setup { context =>
     implicit val system: ActorSystem[_] = context.system
 
     Behaviors.receiveMessage {
-      case AddDeviceMessage(siteId, deviceLocation, deviceType, eventSubscriber) =>
-        val behaviorF = DeviceBehavior(deviceLocation, deviceType, eventSubscriber)
+      case AddDeviceMessage(siteId, deviceLocation, deviceTypePrefix, eventSubscriber) =>
+        val behaviorF = DeviceBehavior(deviceLocation, deviceTypePrefix, eventSubscriber)
         context.pipeToSelf(behaviorF)(DeviceAddedMessage(siteId, _))
         Behaviors.same
 
       case DeviceAddedMessage(siteId, Success((device, behavior))) =>
         context.log.info(s"added ${device.friendlyName} for $siteId")
         val actorRef = context.spawn(behavior, siteId + "_device")
-        DeviceManagerBehavior(devices.updated(siteId, actorRef))
+        DeviceManagerBehavior(devices.updated(siteId, (device, actorRef)))
 
       case DeviceAddedMessage(siteId, Failure(exception)) =>
         context.log.error(s"failed to add device for $siteId", exception)
         Behaviors.stopped
 
       case SendMessage(siteId, deviceMessage) =>
-        devices.get(siteId).foreach(_ ! deviceMessage)
+        devices.get(siteId).foreach(_._2 ! deviceMessage)
         Behaviors.same
     }
   }

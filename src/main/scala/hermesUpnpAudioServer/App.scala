@@ -17,8 +17,8 @@ import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
 object App extends scala.App {
-  val MediaRendererDeviceType = "urn:schemas-upnp-org:device:MediaRenderer:1"
-  val AVTransportServiceType = "urn:schemas-upnp-org:service:AVTransport:1"
+  val MediaRendererDeviceTypePrefix = "urn:schemas-upnp-org:device:MediaRenderer"
+  val AVTransportServiceTypePrefix = "urn:schemas-upnp-org:service:AVTransport"
   val SetAVTransportURIAction = "SetAVTransportURI"
   val PlayAction = "Play"
 
@@ -46,12 +46,13 @@ object App extends scala.App {
 
       val sites = Map(
         "raspi02" -> new URL("http://10.0.0.31:1400/xml/device_description.xml")
+//        "raspi02" -> new URL("http://10.0.0.24:8888/upnp_descriptor_0")
       )
       sites.foreach { case (siteId, deviceLocation) =>
         deviceManager ! DeviceManagerBehavior.AddDeviceMessage(
           siteId,
           deviceLocation,
-          MediaRendererDeviceType,
+          MediaRendererDeviceTypePrefix,
           Map.empty // no subscriptions
         )
       }
@@ -79,13 +80,13 @@ object App extends scala.App {
           for {
             url <- audioServer.ask(AudioServerBehavior.PublishAudioMessage(siteId, requestId, payload, _))
             setUriProperties = Map("InstanceID" -> Some("0"), "CurrentURI" -> Some(url.toString), "CurrentURIMetaData" -> None)
-            setUriMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceType, SetAVTransportURIAction, setUriProperties, _)
+            setUriMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceTypePrefix, SetAVTransportURIAction, setUriProperties, _)
             setUriResponse <- deviceManager.ask((ref: ActorRef[DeviceBehavior.ActionResponse]) => DeviceManagerBehavior.SendMessage(siteId, setUriMessage(ref)))
-            if setUriResponse.properties.isSuccess
+            _ = setUriResponse.properties.failed.foreach(error => logger.warn("SetAVTransportURI response error", error))
             playProperties = Map("InstanceID" -> Some("0"), "Speed" -> Some("1"))
-            playMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceType, PlayAction, playProperties, _)
+            playMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceTypePrefix, PlayAction, playProperties, _)
             playResponse <- deviceManager.ask((ref: ActorRef[DeviceBehavior.ActionResponse]) => DeviceManagerBehavior.SendMessage(siteId, playMessage(ref)))
-            if playResponse.properties.isSuccess
+            _ = playResponse.properties.failed.foreach(error => logger.warn("Play response error", error))
             _ <- Future(Thread.sleep(audio.estimatedDuration(payload).toMillis))
             _ = audioServer ! AudioServerBehavior.RemoveAudioMessage(siteId, requestId)
           } yield (siteId, requestId)
