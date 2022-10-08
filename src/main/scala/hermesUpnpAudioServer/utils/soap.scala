@@ -1,6 +1,5 @@
 package hermesUpnpAudioServer.utils
 
-
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, HttpHeader, HttpMethods, HttpRequest}
 
 import java.net.URL

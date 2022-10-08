@@ -23,6 +23,7 @@ object App extends scala.App {
   val PlayAction = "Play"
 
   val SiteConfigRegex = "^HERMES_UPNP_AUDIO_SERVER_SITE_(.+)$".r
+  val MqttConfigBroker = "HERMES_UPNP_AUDIO_SERVER_MQTT_BROKER"
 
   sealed trait AppMessage
   private final case class StreamCompleted(status: Try[Done]) extends AppMessage
@@ -41,7 +42,7 @@ object App extends scala.App {
 
       val mqttBaseClientId = MqttClient.generateClientId()
       val mqttSettings = MqttConnectionSettings(
-        broker = "tcp://localhost:1883",
+        broker = sys.env.getOrElse(MqttConfigBroker, "tcp://localhost:1883"),
         clientId = "",
         new MemoryPersistence
       )
