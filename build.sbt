@@ -15,8 +15,8 @@ lazy val root = (project in file("."))
     libraryDependencies += "com.typesafe.akka" %% "akka-stream-typed" % AkkaVersion,
     libraryDependencies += "com.typesafe.akka" %% "akka-http" % AkkaHttpVersion,
     libraryDependencies += "com.typesafe.akka" %% "akka-http-xml" % AkkaHttpVersion,
-    libraryDependencies += "com.lightbend.akka" %% "akka-stream-alpakka-mqtt" % "4.0.0",
-    libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.4.3"
+    libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.4.3",
+    libraryDependencies += "org.eclipse.paho" % "org.eclipse.paho.client.mqttv3" % "1.2.5"
   )
 
 (Compile / compile) := ((Compile / compile) dependsOn scalafmtCheckAll).value

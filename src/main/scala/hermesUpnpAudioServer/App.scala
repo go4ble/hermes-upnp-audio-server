@@ -1,19 +1,16 @@
 package hermesUpnpAudioServer
 
-import akka.Done
-import akka.actor.typed.scaladsl.AskPattern.Askable
 import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorRef, ActorSystem, Scheduler}
-import akka.stream.alpakka.mqtt.scaladsl.{MqttSink, MqttSource}
-import akka.stream.alpakka.mqtt.{MqttConnectionSettings, MqttMessage, MqttQoS, MqttSubscriptions}
-import akka.util.{ByteString, Timeout}
+import akka.actor.typed.{ActorSystem, Scheduler}
+import akka.util.Timeout
 import hermesUpnpAudioServer.utils.audio
-import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import org.eclipse.paho.client.mqttv3.{MqttClient, MqttConnectOptions, MqttMessage}
 
 import java.net.URL
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext}
+import scala.util.chaining.scalaUtilChainingOps
 import scala.util.{Failure, Success, Try}
 
 object App extends scala.App {
@@ -26,86 +23,99 @@ object App extends scala.App {
   val MqttConfigBroker = "HERMES_UPNP_AUDIO_SERVER_MQTT_BROKER"
 
   sealed trait AppMessage
-  private final case class StreamCompleted(status: Try[Done]) extends AppMessage
+  private final case class MqttMessageReceived(topic: String, message: MqttMessage) extends AppMessage
+  private final case class SetAVTransportURI(siteId: String, requestId: String, url: URL, duration: FiniteDuration) extends AppMessage
+  private final case class Play(siteId: String, requestId: String, duration: FiniteDuration) extends AppMessage
+  private final case class WaitForAudioDuration(siteId: String, requestId: String, duration: FiniteDuration) extends AppMessage
+  private final case class PlayFinished(siteId: String, requestId: String) extends AppMessage
+  private final case class ActionRequestError(siteId: String, action: String, error: Throwable) extends AppMessage
 
   val actorSystem = ActorSystem(
-    Behaviors.setup[AppMessage] { context =>
-      implicit val ec: ExecutionContext = context.executionContext
-      implicit val system: ActorSystem[_] = context.system
-      implicit val scheduler: Scheduler = system.scheduler
-      implicit val timeout: Timeout = 5.seconds
-      val logger = context.log
+    Behaviors.withTimers[AppMessage] { timerScheduler =>
+      Behaviors.setup[AppMessage] { context =>
+        implicit val ec: ExecutionContext = context.executionContext
+        implicit val system: ActorSystem[_] = context.system
+        implicit val scheduler: Scheduler = system.scheduler
+        implicit val timeout: Timeout = 5.seconds
+        val logger = context.log
 
-      // TODO children monitoring
-      val audioServer = context.spawn(AudioServerBehavior(), "AudioServer")
-      val deviceManager = context.spawn(DeviceManagerBehavior(), "DeviceManager")
+        // TODO children monitoring
+        val audioServer = context.spawn(AudioServerBehavior(), "AudioServer")
+        val deviceManager = context.spawn(DeviceManagerBehavior(), "DeviceManager")
 
-      val mqttBaseClientId = MqttClient.generateClientId()
-      val mqttSettings = MqttConnectionSettings(
-        broker = sys.env.getOrElse(MqttConfigBroker, "tcp://localhost:1883"),
-        clientId = "",
-        new MemoryPersistence
-      )
+        val sites = sys.env.collect { case (SiteConfigRegex(siteId), UrlExtractor(deviceLocation)) => siteId -> deviceLocation }
+        require(sites.nonEmpty, "no site configurations were found")
+        sites.foreach { case (siteId, deviceLocation) =>
+          deviceManager ! DeviceManagerBehavior.AddDeviceMessage(
+            siteId,
+            deviceLocation,
+            MediaRendererDeviceTypePrefix,
+            Map.empty // no subscriptions
+          )
+        }
 
-      val sites = sys.env.collect { case (SiteConfigRegex(siteId), UrlExtractor(deviceLocation)) => siteId -> deviceLocation }
-      require(sites.nonEmpty, "no site configurations were found")
-      sites.foreach { case (siteId, deviceLocation) =>
-        deviceManager ! DeviceManagerBehavior.AddDeviceMessage(
-          siteId,
-          deviceLocation,
-          MediaRendererDeviceTypePrefix,
-          Map.empty // no subscriptions
+        val mqttClient = new MqttClient(
+          sys.env.getOrElse(MqttConfigBroker, "tcp://localhost:1883"),
+          MqttClient.generateClientId(),
+          new MemoryPersistence
         )
-      }
+        mqttClient.connect((new MqttConnectOptions).tap(_.setCleanSession(true)))
+        // TODO close connection on application shutdown
 
-      val mqttSource = MqttSource.atMostOnce(
-        settings = mqttSettings.withClientId(mqttBaseClientId + "_source"),
-        subscriptions = MqttSubscriptions(PlayBytesTopic.topic, MqttQoS.atLeastOnce),
-        bufferSize = 1
-      )
+        mqttClient.subscribe(
+          PlayBytesTopic.topic,
+          2,
+          (topic: String, message: MqttMessage) => {
+            context.self ! MqttMessageReceived(topic, message)
+          }
+        )
 
-      val mqttSink = MqttSink(
-        connectionSettings = mqttSettings.withClientId(mqttBaseClientId + "_sink"),
-        defaultQos = MqttQoS.atLeastOnce
-      )
+        Behaviors.receiveMessage {
+          case MqttMessageReceived(topic @ PlayBytesTopic(siteId, requestId), message) =>
+            logger.debug(s"play bytes (${message.getPayload.length}): $topic")
+            val estimatedDuration = audio.estimatedDuration(message.getPayload)
+            val replyTo = context.messageAdapter[URL](SetAVTransportURI(siteId, requestId, _, estimatedDuration))
+            audioServer ! AudioServerBehavior.PublishAudioMessage(siteId, requestId, message.getPayload, replyTo)
+            Behaviors.same
 
-      val streamStatus = mqttSource
-        .filter(_.topic match {
-          case PlayBytesTopic(siteId, _) => sites contains siteId
-          case _                         => false
-        })
-        .mapAsyncUnordered(sites.size) { mqttMessage =>
-          val PlayBytesTopic(siteId, requestId) = mqttMessage.topic
-          val payload = mqttMessage.payload.toArray
-          logger.debug(s"play bytes (${payload.length}): " + mqttMessage.topic)
-          for {
-            url <- audioServer.ask(AudioServerBehavior.PublishAudioMessage(siteId, requestId, payload, _))
-            setUriProperties = Map("InstanceID" -> Some("0"), "CurrentURI" -> Some(url.toString), "CurrentURIMetaData" -> None)
-            setUriMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceTypePrefix, SetAVTransportURIAction, setUriProperties, _)
-            setUriResponse <- deviceManager.ask((ref: ActorRef[DeviceBehavior.ActionResponse]) => DeviceManagerBehavior.SendMessage(siteId, setUriMessage(ref)))
-            _ = setUriResponse.properties.failed.foreach(error => logger.warn("SetAVTransportURI response error", error))
-            playProperties = Map("InstanceID" -> Some("0"), "Speed" -> Some("1"))
-            playMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceTypePrefix, PlayAction, playProperties, _)
-            playResponse <- deviceManager.ask((ref: ActorRef[DeviceBehavior.ActionResponse]) => DeviceManagerBehavior.SendMessage(siteId, playMessage(ref)))
-            _ = playResponse.properties.failed.foreach(error => logger.warn("Play response error", error))
-            _ <- Future(Thread.sleep(audio.estimatedDuration(payload).toMillis))
-            _ = audioServer ! AudioServerBehavior.RemoveAudioMessage(siteId, requestId)
-          } yield (siteId, requestId)
+          case MqttMessageReceived(unexpectedTopic, _) =>
+            context.log.error(s"unexpected topic received: $unexpectedTopic")
+            Behaviors.same
+
+          case SetAVTransportURI(siteId, requestId, url, duration) =>
+            val setUriProperties = Map("InstanceID" -> Some("0"), "CurrentURI" -> Some(url.toString), "CurrentURIMetaData" -> None)
+            val replyTo = context.messageAdapter[DeviceBehavior.ActionResponse] {
+              case DeviceBehavior.ActionResponse(_, _, Success(_))                  => Play(siteId, requestId, duration)
+              case DeviceBehavior.ActionResponse(_, actionName, Failure(exception)) => ActionRequestError(siteId, actionName, exception)
+            }
+            val setUriMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceTypePrefix, SetAVTransportURIAction, setUriProperties, replyTo)
+            deviceManager ! DeviceManagerBehavior.SendMessage(siteId, setUriMessage)
+            Behaviors.same
+
+          case Play(siteId, requestId, duration) =>
+            val playProperties = Map("InstanceID" -> Some("0"), "Speed" -> Some("1"))
+            val replyTo = context.messageAdapter[DeviceBehavior.ActionResponse] {
+              case DeviceBehavior.ActionResponse(_, _, Success(_))                  => WaitForAudioDuration(siteId, requestId, duration)
+              case DeviceBehavior.ActionResponse(_, actionName, Failure(exception)) => ActionRequestError(siteId, actionName, exception)
+            }
+            val playMessage = DeviceBehavior.ActionRequestMessage(AVTransportServiceTypePrefix, PlayAction, playProperties, replyTo)
+            deviceManager ! DeviceManagerBehavior.SendMessage(siteId, playMessage)
+            Behaviors.same
+
+          case WaitForAudioDuration(siteId, requestId, duration) =>
+            timerScheduler.startSingleTimer(PlayFinished(siteId, requestId), duration)
+            Behaviors.same
+
+          case PlayFinished(siteId, requestId) =>
+            audioServer ! AudioServerBehavior.RemoveAudioMessage(siteId, requestId)
+            val playFinishedMessage = new MqttMessage(s"""{"id":"$requestId"}""".getBytes)
+            mqttClient.publish(PlayFinishedTopic(siteId), playFinishedMessage)
+            Behaviors.same
+
+          case ActionRequestError(siteId, actionName, exception) =>
+            context.log.error(s"Error submitting action ($actionName) for $siteId", exception)
+            Behaviors.same
         }
-        .map { case (siteId, requestId) =>
-          MqttMessage(PlayFinishedTopic(siteId), ByteString(s"""{"id":"$requestId"}"""))
-        }
-        .runWith(mqttSink)
-      context.pipeToSelf(streamStatus)(StreamCompleted)
-
-      Behaviors.receiveMessage {
-        case StreamCompleted(Success(_)) =>
-          context.log.info("stream stopped expectedly")
-          Behaviors.stopped
-
-        case StreamCompleted(Failure(exception)) =>
-          context.log.error("stream stopped unexpectedly", exception)
-          Behaviors.stopped
       }
     },
     "App"
