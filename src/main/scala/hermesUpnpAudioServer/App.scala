@@ -1,7 +1,10 @@
 package hermesUpnpAudioServer
 
+import akka.Done
+import akka.actor.CoordinatedShutdown
+import akka.actor.typed.scaladsl.AskPattern.Askable
 import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorSystem, Scheduler}
+import akka.actor.typed.{ActorRef, ActorSystem, Scheduler}
 import akka.util.Timeout
 import hermesUpnpAudioServer.utils.audio
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
@@ -29,6 +32,7 @@ object App extends scala.App {
   private final case class WaitForAudioDuration(siteId: String, requestId: String, duration: FiniteDuration) extends AppMessage
   private final case class PlayFinished(siteId: String, requestId: String) extends AppMessage
   private final case class ActionRequestError(siteId: String, action: String, error: Throwable) extends AppMessage
+  private final case class Shutdown(replyTo: ActorRef[Done]) extends AppMessage
 
   val actorSystem = ActorSystem(
     Behaviors.withTimers[AppMessage] { timerScheduler =>
@@ -39,9 +43,10 @@ object App extends scala.App {
         implicit val timeout: Timeout = 5.seconds
         val logger = context.log
 
-        // TODO children monitoring
         val audioServer = context.spawn(AudioServerBehavior(), "AudioServer")
+        context.watch(audioServer)
         val deviceManager = context.spawn(DeviceManagerBehavior(), "DeviceManager")
+        context.watch(deviceManager)
 
         val sites = sys.env.collect { case (SiteConfigRegex(siteId), UrlExtractor(deviceLocation)) => siteId -> deviceLocation }
         require(sites.nonEmpty, "no site configurations were found")
@@ -60,7 +65,6 @@ object App extends scala.App {
           new MemoryPersistence
         )
         mqttClient.connect((new MqttConnectOptions).tap(_.setCleanSession(true)))
-        // TODO close connection on application shutdown
 
         mqttClient.subscribe(
           PlayBytesTopic.topic,
@@ -115,11 +119,21 @@ object App extends scala.App {
           case ActionRequestError(siteId, actionName, exception) =>
             context.log.error(s"Error submitting action ($actionName) for $siteId", exception)
             Behaviors.same
+
+          case Shutdown(replyTo) =>
+            context.log.info("Shutting down application...")
+            mqttClient.disconnect()
+            replyTo ! Done
+            Behaviors.same
         }
       }
     },
     "App"
   )
+
+  CoordinatedShutdown(actorSystem).addTask(CoordinatedShutdown.PhaseBeforeServiceUnbind, "shutdown-task") { () =>
+    actorSystem.ask(Shutdown)(15.seconds, actorSystem.scheduler)
+  }
 
   Await.result(actorSystem.whenTerminated, Duration.Inf)
 
