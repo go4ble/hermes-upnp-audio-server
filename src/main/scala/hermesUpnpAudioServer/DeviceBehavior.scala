@@ -59,7 +59,7 @@ object DeviceBehavior {
       response <- Http().singleRequest(HttpRequest(uri = deviceLocation.toString))
       _ = require(response.status.isSuccess())
       contentType = response.entity.contentType
-      _ = if (!nodeSeqMediaTypes.contains(contentType)) system.log.warn(s"unexpected content type: $contentType")
+      _ = if (!nodeSeqMediaTypes.contains(contentType.mediaType)) system.log.warn(s"unexpected content type: $contentType")
       responseXml <- Unmarshal(response.entity.withContentType(ContentTypes.`text/xml(UTF-8)`)).to[NodeSeq]
       deviceXmlOpt = (responseXml \\ "device").find(node => (node \ "deviceType").headOption.map(_.text).exists(_ startsWith deviceTypePrefix))
       deviceXml = deviceXmlOpt.getOrElseError(s"could not locate device $deviceTypePrefix at $deviceLocation")
