@@ -28,13 +28,15 @@ object AudioServerBehavior {
   def apply(): Behavior[AudioServerMessage] = Behaviors.setup { context =>
     implicit val system: ActorSystem[_] = context.system
 
-    val serverPort = getAvailablePort
-    val server = Http().newServerAt(defaultInterface, serverPort).connectionSource().runForeach { connection =>
+    val serverPort = sys.env.get("HERMES_UPNP_AUDIO_SERVER_PORT").flatMap(_.toIntOption).getOrElse(8080)
+    val serverInterface = sys.env.getOrElse("HERMES_UPNP_AUDIO_SERVER_INTERFACE", "0.0.0.0")
+    val serverHost = sys.env.get("HERMES_UPNP_AUDIO_SERVER_HOST")
+    val server = Http().newServerAt(serverInterface, serverPort).connectionSource().runForeach { connection =>
       connection.handleWithAsyncHandler(request => context.self.ask(HttpRequestMessage(request, _))(5.seconds, system.scheduler))
     }
     context.pipeToSelf(server)(ServerCeasedMessage)
 
-    val baseUrl = new URL("http", defaultInterface, serverPort, "")
+    val baseUrl = new URL("http", serverHost getOrElse defaultInterface, serverPort, "")
     context.log.info(s"starting audio server at $baseUrl")
     AudioServerBehavior(baseUrl)
   }
