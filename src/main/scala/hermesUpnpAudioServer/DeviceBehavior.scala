@@ -153,7 +153,7 @@ object DeviceBehavior {
 
       case ServiceSubscriptionMessage(serviceType, Success(response)) =>
         val subscriptionId = response.headers.find(_ is "sid").map(_.value()).getOrElseError("unable to find SID is subscription response")
-        val subscriptionTimeout = response.headers.find(_ is "timeout").map(_.value()).getOrElseError("unable to find TIMEOUT in subscription response")
+        // val subscriptionTimeout = response.headers.find(_ is "timeout").map(_.value()).getOrElseError("unable to find TIMEOUT in subscription response")
         // TODO renew subscriptions with timer
         // TODO unsubscribe in coordinated shutdown
         context.log.info(s"successfully subscribed to $serviceType with id $subscriptionId")
@@ -178,7 +178,7 @@ object DeviceBehavior {
     case HttpHeader.ParsingResult.Error(error)  => throw new Exception(s"failed to parse header ($name, $value): $error")
   }
 
-  def getEventProperties(xml: Elem): Properties =
+  private def getEventProperties(xml: Elem): Properties =
     xml.child
       .collect { case elem: Elem => getEventProperties(elem) }
       .foldLeft(Map.empty: Properties)(_ ++ _)

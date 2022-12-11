@@ -4,28 +4,40 @@ import akka.Done
 import akka.actor.CoordinatedShutdown
 import akka.actor.typed.scaladsl.AskPattern.Askable
 import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorRef, ActorSystem, Scheduler}
-import akka.util.Timeout
+import akka.actor.typed.{ActorRef, ActorSystem}
 import hermesUpnpAudioServer.utils.audio
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
-import org.eclipse.paho.client.mqttv3.{MqttClient, MqttConnectOptions, MqttMessage}
+import org.eclipse.paho.client.mqttv3.{IMqttMessageListener, MqttClient, MqttConnectOptions, MqttMessage}
 
 import java.net.URL
+import scala.concurrent.Await
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext}
 import scala.util.chaining.scalaUtilChainingOps
 import scala.util.{Failure, Success, Try}
 
+/*
+ * MqttMessageReceived
+ *   ▼
+ * AudioServer.PublishAudio
+ *   ▼
+ * SetAVTransportURI ──► DeviceManager.Send
+ *   ▼
+ * Play ──► DeviceManager.Send
+ *   ▼
+ * WaitForAudioDuration
+ *   ▼
+ * PlayFinished ──► AudioServer.RemoveAudio
+ */
 object App extends scala.App {
-  val MediaRendererDeviceTypePrefix = "urn:schemas-upnp-org:device:MediaRenderer"
-  val AVTransportServiceTypePrefix = "urn:schemas-upnp-org:service:AVTransport"
-  val SetAVTransportURIAction = "SetAVTransportURI"
-  val PlayAction = "Play"
+  private val MediaRendererDeviceTypePrefix = "urn:schemas-upnp-org:device:MediaRenderer"
+  private val AVTransportServiceTypePrefix = "urn:schemas-upnp-org:service:AVTransport"
+  private val SetAVTransportURIAction = "SetAVTransportURI"
+  private val PlayAction = "Play"
 
-  val SiteConfigRegex = "^HERMES_UPNP_AUDIO_SERVER_SITE_(.+)$".r
-  val MqttConfigBroker = "HERMES_UPNP_AUDIO_SERVER_MQTT_BROKER"
+  private val SiteConfigRegex = "^HERMES_UPNP_AUDIO_SERVER_SITE_(.+)$".r
+  private val MqttConfigBroker = "HERMES_UPNP_AUDIO_SERVER_MQTT_BROKER"
 
-  sealed trait AppMessage
+  private sealed trait AppMessage
   private final case class MqttMessageReceived(topic: String, message: MqttMessage) extends AppMessage
   private final case class SetAVTransportURI(siteId: String, requestId: String, url: URL, duration: FiniteDuration) extends AppMessage
   private final case class Play(siteId: String, requestId: String, duration: FiniteDuration) extends AppMessage
@@ -34,13 +46,9 @@ object App extends scala.App {
   private final case class ActionRequestError(siteId: String, action: String, error: Throwable) extends AppMessage
   private final case class Shutdown(replyTo: ActorRef[Done]) extends AppMessage
 
-  val actorSystem = ActorSystem(
+  private val actorSystem = ActorSystem(
     Behaviors.withTimers[AppMessage] { timerScheduler =>
       Behaviors.setup[AppMessage] { context =>
-        implicit val ec: ExecutionContext = context.executionContext
-        implicit val system: ActorSystem[_] = context.system
-        implicit val scheduler: Scheduler = system.scheduler
-        implicit val timeout: Timeout = 5.seconds
         val logger = context.log
 
         val audioServer = context.spawn(AudioServerBehavior(), "AudioServer")
@@ -66,13 +74,17 @@ object App extends scala.App {
         )
         mqttClient.connect((new MqttConnectOptions).tap(_.setCleanSession(true)))
 
-        mqttClient.subscribe(
-          PlayBytesTopic.topic,
-          2,
-          (topic: String, message: MqttMessage) => {
-            context.self ! MqttMessageReceived(topic, message)
+        val (topics, qos, messageListeners) = sites
+          .map { case (siteId, _) =>
+            (
+              PlayBytesTopic(siteId),
+              2,
+              ((topic: String, message: MqttMessage) => { context.self ! MqttMessageReceived(topic, message) }): IMqttMessageListener
+            )
           }
-        )
+          .toArray
+          .unzip3
+        mqttClient.subscribe(topics, qos, messageListeners)
 
         Behaviors.receiveMessage {
           case MqttMessageReceived(topic @ PlayBytesTopic(siteId, requestId), message) =>
@@ -138,7 +150,7 @@ object App extends scala.App {
   Await.result(actorSystem.whenTerminated, Duration.Inf)
 
   private object PlayBytesTopic {
-    val topic: String = "hermes/audioServer/+/playBytes/+"
+    def apply(siteId: String): String = s"hermes/audioServer/$siteId/playBytes/+"
 
     def unapply(topic: String): Option[(String, String)] = topic.split('/') match {
       case Array("hermes", "audioServer", siteId, "playBytes", requestId) => Some((siteId, requestId))

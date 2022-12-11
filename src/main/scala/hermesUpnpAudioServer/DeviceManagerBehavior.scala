@@ -45,7 +45,10 @@ object DeviceManagerBehavior {
         Behaviors.stopped
 
       case SendMessage(siteId, deviceMessage) =>
-        devices.get(siteId).foreach { case (_, device) => device ! deviceMessage }
+        devices.get(siteId) match {
+          case Some((_, deviceBehavior)) => deviceBehavior ! deviceMessage
+          case _                         => context.log.error(s"unknown device: $siteId")
+        }
         Behaviors.same
     }
   }
